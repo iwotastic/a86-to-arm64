@@ -1,0 +1,5 @@
+### Repo-specific stuff ###
+courselangs/
+
+### Standard macOS gitignore stuff ###
+.DS_Store
