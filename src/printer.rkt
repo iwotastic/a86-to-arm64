@@ -1,7 +1,8 @@
 #lang racket
 
 ;; This file is based on the printer.rkt found in the langs package, but has been modified to emit
-;; semantically equivalent arm64 assembly.
+;; semantically equivalent arm64 assembly. Changes from the original a86 printer.rkt are explained in
+;; commments.
 
 (provide/contract
  [asm-string  (-> (listof instruction?) string?)] ; deprecated
@@ -13,6 +14,7 @@
 (module* private #f
   (provide current-shared?))
 
+;; Updated require to point to the "real" a86's ast module.
 (require a86/ast)
 
 ;; Any -> Boolean
@@ -20,8 +22,42 @@
   (register? x))
 
 ;; Reg -> String
+;; Modified to output equivalent Arm registers, this mapping was devised with the help of this
+;; StackOverflow post about x86 (https://stackoverflow.com/questions/18024672) and this page from
+;; the Arm manual (https://developer.arm.com/documentation/102374/0101/Procedure-Call-Standard).
 (define (reg->string r)
-  (symbol->string r))
+  (match r
+    ; Returns
+    ['rax "x0"]
+    ['eax "w0"]
+    ['rdx "x1"]
+
+    ; Params
+    ['rdi "x0"]
+    ['rsi "x1"]
+    ['rdx "x2"]
+    ['rcx "x3"]
+
+    ; Corruptable/scratch
+    ['r8  "x9"]
+    ['r9  "x10"]
+    ['r10 "x11"]
+    ['r11 "x12"]
+
+    ; Callee-saved
+    ['rbx "x19"]
+    ['r12 "x20"]
+    ['r13 "x21"]
+    ['r14 "x22"]
+    ['r15 "x23"]
+    ['rbp "x24"]
+
+    ; Special registers
+    ['rsp "sp"]))
+
+;; Helper function to prefix immediates with # as required by the LLVM assembler.
+(define (immediate->string i)
+  (string-append "#" (number->string i)))
 
 ;; Asm -> String
 (define (asm-string a)
@@ -58,14 +94,21 @@
   ;; Arg -> String
   (define (arg->string a)
     (match a
+      ;; The simple case, just a register
       [(? reg?) (reg->string a)]
-      [(? integer?) (number->string a)]
+      ;; This case has been modified because in Arm assembler. Immediates are required to be prefixed
+      ;; by a #
+      [(? integer?) (immediate->string a)]
+      ;; This case has also been updated for compatibility with the Arm assembler.
       [(Offset (? reg? r) i)
-       (string-append "[" (reg->string r) " + " (number->string i) "]")]
+       (string-append "[" (reg->string r) ", " (immediate->string i) "]")]
+      ;; We pray that this case is not used
       [(Offset (? label? l) i)
-       (string-append "[" (label-symbol->string l) " + " (number->string i) "]")]
+       (string-append "[" (label-symbol->string l) " + " (immediate->string i) "]")]
+      ;; Likewise for this
       [(Const l)
        (symbol->string l)]
+      ;; And for this.
       [(? exp?) (exp->string a)]))
 
   ;; Exp -> String
@@ -91,29 +134,33 @@
   ;; Instruction -> String
   (define (simple-instr->string i)
     (match i
-      [(Text)      (string-append tab "section .text")]
+      ;;; Metadata and global stuff ;;;
+
+      [(Text)      (string-append tab ".text")]
       [(Data)      (string-append tab "section .data align=8")] ; 8-byte aligned data
       [(Ret)       (string-append tab "ret")]
       [(Label l)   (string-append (label-symbol->string l) ":")]
-      [(Global x)  (string-append tab "global "  (label-symbol->string x))]
-      [(Extern l)  (begin0 (string-append tab "extern " (label-symbol->string l))
+      [(Global x)  (string-append tab ".global "  (label-symbol->string x))]
+      [(Extern l)  (begin0 (string-append tab ".extern " (label-symbol->string l))
                            (set! external-labels (cons l external-labels)))]
-      [(Mov a1 a2)
-       (string-append tab "mov "
-                      (arg->string a1) ", "
-                      (arg->string a2))]
+
+      ;;; Simple math instructions ;;;
+      ;;; These instructions have been updated to support Arm64's more expressive format for the add
+      ;;; and sub instructions. That is, add and sub can have differing source and destination
+      ;;; registers, so we just print the first arg twice because that is easy.
+
       [(Add a1 a2)
        (string-append tab "add "
+                      (arg->string a1) ", "
                       (arg->string a1) ", "
                       (arg->string a2))]
       [(Sub a1 a2)
        (string-append tab "sub "
                       (arg->string a1) ", "
-                      (arg->string a2))]
-      [(Cmp a1 a2)
-       (string-append tab "cmp "
                       (arg->string a1) ", "
                       (arg->string a2))]
+
+      ;;; Bitwise and logical math operators ;;;
       [(Sal a1 a2)
        (string-append tab "sal "
                       (arg->string a1) ", "
@@ -134,79 +181,119 @@
        (string-append tab "xor "
                       (arg->string a1) ", "
                       (arg->string a2))]
+
+      ;;; Move - the first difficult instruction ;;;
+
+      [(Mov a1 a2)
+       (string-append tab "mov "
+                      (arg->string a1) ", "
+                      (arg->string a2))]
+
+      ;;; Comparisons and conditional jumps ;;;
+      ;;; Unexpectedly, these are actually probably the most trivial translations found in this
+      ;;; project.
+
+      [(Cmp a1 a2)
+       (string-append tab "cmp "
+                      (arg->string a1) ", "
+                      (arg->string a2))]
       [(Jmp l)
-       (string-append tab "jmp "
+       (string-append tab "b "
                       (jump-target->string l))]
       [(Je l)
-       (string-append tab "je "
+       (string-append tab "b.eq "
                       (jump-target->string l))]
       [(Jne l)
-       (string-append tab "jne "
+       (string-append tab "b.ne "
                       (jump-target->string l))]
       [(Jl l)
-       (string-append tab "jl "
+       (string-append tab "b.lt "
                       (jump-target->string l))]
       [(Jle l)
-       (string-append tab "jle "
+       (string-append tab "b.le "
                       (jump-target->string l))]
       [(Jg l)
-       (string-append tab "jg "
+       (string-append tab "b.gt "
                       (jump-target->string l))]
       [(Jge l)
-       (string-append tab "jge "
+       (string-append tab "b.ge "
                       (jump-target->string l))]
       [(Jo l)
-       (string-append tab "jo "
+       (string-append tab "b.vs "
                       (jump-target->string l))]
       [(Jno l)
-       (string-append tab "jno "
+       (string-append tab "b.vc "
                       (jump-target->string l))]
       [(Jc l)
-       (string-append tab "jc "
+       (string-append tab "b.cs "
                       (jump-target->string l))]
       [(Jnc l)
-       (string-append tab "jnc "
+       (string-append tab "b.cc "
                       (jump-target->string l))]
+
+      ;;; Conditional moves ;;;
+      ;;; There is no direct equivalent of these instructions in Arm64, as a result, we will just
+      ;;; rely on the fact that we already have jumps and moves done, so we can just use those.
       [(Cmove dst src)
-       (string-append tab "cmove "
-                      (reg->string dst) ", "
-                      (arg->string src))]
+       (apply string-append
+          (map (lambda (i) (string-append (simple-instr->string i) "\n"))
+            (let ((nomov (gensym 'nomov))) (seq (Jne nomov)
+                                                (Mov dst src)
+                                                (Label nomov)))))]
       [(Cmovne dst src)
-       (string-append tab "cmovne "
-                      (reg->string dst) ", "
-                      (arg->string src))]
+       (apply string-append
+          (map (lambda (i) (string-append (simple-instr->string i) "\n"))
+            (let ((nomov (gensym 'nomov))) (seq (Je nomov)
+                                                (Mov dst src)
+                                                (Label nomov)))))]
       [(Cmovl dst src)
-       (string-append tab "cmovl "
-                      (reg->string dst) ", "
-                      (arg->string src))]
+       (apply string-append
+          (map (lambda (i) (string-append (simple-instr->string i) "\n"))
+            (let ((nomov (gensym 'nomov))) (seq (Jge nomov)
+                                                (Mov dst src)
+                                                (Label nomov)))))]
       [(Cmovle dst src)
-       (string-append tab "cmovle "
-                      (reg->string dst) ", "
-                      (arg->string src))]
+       (apply string-append
+          (map (lambda (i) (string-append (simple-instr->string i) "\n"))
+            (let ((nomov (gensym 'nomov))) (seq (Jg nomov)
+                                                (Mov dst src)
+                                                (Label nomov)))))]
       [(Cmovg dst src)
-       (string-append tab "cmovg "
-                      (reg->string dst) ", "
-                      (arg->string src))]
+       (apply string-append
+          (map (lambda (i) (string-append (simple-instr->string i) "\n"))
+            (let ((nomov (gensym 'nomov))) (seq (Jle nomov)
+                                                (Mov dst src)
+                                                (Label nomov)))))]
       [(Cmovge dst src)
-       (string-append tab "cmovge "
-                      (reg->string dst) ", "
-                      (arg->string src))]
+       (apply string-append
+          (map (lambda (i) (string-append (simple-instr->string i) "\n"))
+            (let ((nomov (gensym 'nomov))) (seq (Jl nomov)
+                                                (Mov dst src)
+                                                (Label nomov)))))]
       [(Cmovo dst src)
-       (string-append tab "cmovo "
-                      (reg->string dst) ", "
-                      (arg->string src))]
+       (apply string-append
+          (map (lambda (i) (string-append (simple-instr->string i) "\n"))
+            (let ((nomov (gensym 'nomov))) (seq (Jno nomov)
+                                                (Mov dst src)
+                                                (Label nomov)))))]
       [(Cmovno dst src)
-       (string-append tab "cmovno "
-                      (reg->string dst) ", "
-                      (arg->string src))]
+       (apply string-append
+          (map (lambda (i) (string-append (simple-instr->string i) "\n"))
+            (let ((nomov (gensym 'nomov))) (seq (Jo nomov)
+                                                (Mov dst src)
+                                                (Label nomov)))))]
       [(Cmovc dst src)
-       (string-append tab "cmovc "
-                      (reg->string dst) ", "
-                      (arg->string src))]
+       (apply string-append
+          (map (lambda (i) (string-append (simple-instr->string i) "\n"))
+            (let ((nomov (gensym 'nomov))) (seq (Jnc nomov)
+                                                (Mov dst src)
+                                                (Label nomov)))))]
       [(Cmovnc dst src)
-       (string-append tab "cmovnc "
-                      (reg->string dst) ", "
-                      (arg->string src))]
+       (apply string-append
+          (map (lambda (i) (string-append (simple-instr->string i) "\n"))
+            (let ((nomov (gensym 'nomov))) (seq (Jc nomov)
+                                                (Mov dst src)
+                                                (Label nomov)))))]
       [(Call l)
        (string-append tab "call "
                       (jump-target->string l))]
@@ -276,8 +363,8 @@
      (begin
        (write-string (string-append
                       ; tab "global " (label-symbol->string g) "\n"
-                      tab "default rel\n"
-                      tab "section .text\n"))
+                      tab ".align 2\n"
+                      tab ".text\n"))
        (instrs-display a))]
     [_
      (instrs-display a)
