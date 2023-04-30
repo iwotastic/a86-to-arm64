@@ -45,6 +45,10 @@
     ['r11 "x12"]
     ;; Note: In certain spots in this file I use the register x13 because it is not exposed to the
     ;; a86 code and is corruptable, so I use it as my invisible scratch register.
+    ;;
+    ;; Additionally, x14 is used to hold flags, so that I can detect pushing a return address, so that
+    ;; I can properly redirect that functionallity into setting x30 to allow proper return
+    ;; functionallity.
 
     ; Callee-saved
     ['rbx "x19"]
@@ -140,8 +144,12 @@
 
       [(Text)      (string-append tab ".text")]
       [(Data)      (string-append tab "section .data align=8")] ; 8-byte aligned data
-      [(Ret)       (string-append tab "ret")]
-      [(Label l) (string-append (label-symbol->string l) ":")]
+      [(Label l) (if (equal? l 'entry)
+                      ; If we are the entry label, we need to remember where to return to.
+                      (string-append "_entry:\n"
+                                     tab "stp x29, x30, [sp, #-16]!\n"
+                                     tab "mov x29, sp")
+                      (string-append (label-symbol->string l) ":"))]
       [(Global x)  (string-append tab ".global "  (label-symbol->string x))]
       [(Extern l)  (begin0 (string-append tab ".extern " (label-symbol->string l))
                            (set! external-labels (cons l external-labels)))]
@@ -191,16 +199,18 @@
                       (arg->string a1) ", "
                       (arg->string a1) ", "
                       (arg->string a2))]
+
       [(Or a1 a2)
-       (string-append tab "orr "
+       (string-append tab "mov x13, " (arg->string a2) "\n"
+                      tab "orr "
                       (arg->string a1) ", "
-                      (arg->string a1) ", "
-                      (arg->string a2))]
+                      (arg->string a1) ", x13")]
+
       [(Xor a1 a2)
-       (string-append tab "eor "
+       (string-append tab "mov x13, " (arg->string a2) "\n"
+                      tab "eor "
                       (arg->string a1) ", "
-                      (arg->string a1) ", "
-                      (arg->string a2))]
+                      (arg->string a1) ", x13")]
 
       ;;; Move - the first difficult instruction ;;;
 
@@ -239,15 +249,25 @@
 
       ;;; Comparisons and conditional jumps ;;;
       ;;; Unexpectedly, these are actually probably the most trivial translations found in this
-      ;;; project.
+      ;;; project, with the exception of cmp itself, but that is to patch the behavior of the
+      ;;; assert-codepoint routine.
 
       [(Cmp a1 a2)
-       (string-append tab "cmp "
-                      (arg->string a1) ", "
-                      (arg->string a2))]
+       (if (and (integer? a2) (> a2 4095))
+           (string-append tab "ldr x13, =" (number->string a2) "\n"
+                          tab "cmp " (arg->string a1) ", x13")
+           (string-append tab "cmp "
+                          (arg->string a1) ", "
+                          (arg->string a2)))]
+
+      ; Special jump to register
+      [(Jmp (? reg? l))
+       (string-append tab "br "
+                      (jump-target->string l))]
       [(Jmp l)
        (string-append tab "b "
                       (jump-target->string l))]
+
       [(Je l)
        (string-append tab "b.eq "
                       (jump-target->string l))]
@@ -342,26 +362,45 @@
             (let ((nomov (gensym 'nomov))) (seq (Jc nomov)
                                                 (Mov dst src)
                                                 (Label nomov)))))]
+
+      ;;; Function calls ;;;
+
       [(Call l)
-       (string-append tab "stp x29, x30, [sp, #-16]!\n" ; Store return address to stack
-                      tab "mov x29, sp\n"
-                      tab "bl " (jump-target->string l) "\n"
-                      tab "ldp x29, x30, [sp], #16")]
+       (string-append tab "bl " (jump-target->string l) "\n")]
+
+      [(Ret)
+       (let ((should-pop (gensym 'pop)))
+            (string-append tab "ldp x29, x30, [sp], #16\n" ; If it is, load the link register
+                           tab "ret"))]
+
+      ;;; Stack stuff ;;;
+
       [(Push a)
-       (string-append tab "mov x13, " (arg->string a) "\n"
-                      tab "stp xzr, x13, [sp, #-16]!\n")]
+       (if (equal? a 'rax)
+           ;; This continues my function call detection by or-ing x14 (our return flag register) with
+           ;; 10, this means that a successful return address push will result in 0b1111 being in x14.
+           (string-append tab "stp x29, x0, [sp, #-16]!\n")
+           (string-append tab "mov x13, " (arg->string a) "\n"
+                          tab "stp xzr, x13, [sp, #-16]!\n"))]
       [(Pop r)
        (string-append tab "ldp xzr, "
                       (reg->string r)
                       ", [sp], #16")]
+
       [(Lea d (? offset? x))
        (string-append tab "lea "
                       (arg->string d) ", "
                       (arg->string x))]
       [(Lea d x)
-       (string-append tab "lea "
-                      (arg->string d) ", [rel "
-                      (exp->string x) "]")]
+       (string-append (if (equal? d 'rax) (string-append
+                        tab "mov x14, #5\n" ; Nifty hack to allow us to try to track function calls
+                                            ; This sets a flag that will be picked up in the ret
+                                            ; instruction. The reason it is 5 instead of something simple
+                                            ; is so that it can't be accidentally set by C.
+                        ) "")
+                      tab "adr "
+                      (arg->string d) ", "
+                      (exp->string x))]
       [(Not r)
        (string-append tab "not "
                       (reg->string r))]
