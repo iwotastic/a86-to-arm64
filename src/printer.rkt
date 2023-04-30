@@ -43,6 +43,8 @@
     ['r9  "x10"]
     ['r10 "x11"]
     ['r11 "x12"]
+    ;; Note: In certain spots in this file I use the register x13 because it is not exposed to the
+    ;; a86 code and is corruptable, so I use it as my invisible scratch register.
 
     ; Callee-saved
     ['rbx "x19"]
@@ -139,7 +141,7 @@
       [(Text)      (string-append tab ".text")]
       [(Data)      (string-append tab "section .data align=8")] ; 8-byte aligned data
       [(Ret)       (string-append tab "ret")]
-      [(Label l)   (string-append (label-symbol->string l) ":")]
+      [(Label l) (string-append (label-symbol->string l) ":")]
       [(Global x)  (string-append tab ".global "  (label-symbol->string x))]
       [(Extern l)  (begin0 (string-append tab ".extern " (label-symbol->string l))
                            (set! external-labels (cons l external-labels)))]
@@ -148,46 +150,92 @@
       ;;; These instructions have been updated to support Arm64's more expressive format for the add
       ;;; and sub instructions. That is, add and sub can have differing source and destination
       ;;; registers, so we just print the first arg twice because that is easy.
+      ;;;
+      ;;; These instructions also have a transparent second funtionality, they automatically detect
+      ;;; stack operations and silently double the operand of stack operations. The reason for this is
+      ;;; is to ensurre we obey the 16-byte alignment required by the architecture.
 
       [(Add a1 a2)
-       (string-append tab "add "
+       (match a1
+        ['rsp (string-append tab "mov x13, " (arg->string a2) "\n"
+                             tab "lsl x13, x13, #1\n" ; Multiply by 2
+                             tab "add sp, sp, x13")]
+        [a1 (string-append tab "add "
                       (arg->string a1) ", "
                       (arg->string a1) ", "
-                      (arg->string a2))]
+                      (arg->string a2))])]
       [(Sub a1 a2)
-       (string-append tab "sub "
+       (match a1
+        ['rsp (string-append tab "mov x13, " (arg->string a2) "\n"
+                             tab "lsl x13, x13, #1\n" ; Multiply by 2
+                             tab "sub sp, sp, x13")]
+        [a1 (string-append tab "sub "
                       (arg->string a1) ", "
                       (arg->string a1) ", "
-                      (arg->string a2))]
+                      (arg->string a2))])]
 
       ;;; Bitwise and logical math operators ;;;
       [(Sal a1 a2)
-       (string-append tab "sal "
+       ; Note to self: This translation may not be completely equivalent
+       (string-append tab "lsl "
+                      (arg->string a1) ", "
                       (arg->string a1) ", "
                       (arg->string a2))]
       [(Sar a1 a2)
-       (string-append tab "sar "
+       (string-append tab "asr "
+                      (arg->string a1) ", "
                       (arg->string a1) ", "
                       (arg->string a2))]
       [(And a1 a2)
        (string-append tab "and "
                       (arg->string a1) ", "
+                      (arg->string a1) ", "
                       (arg->string a2))]
       [(Or a1 a2)
-       (string-append tab "or "
+       (string-append tab "orr "
+                      (arg->string a1) ", "
                       (arg->string a1) ", "
                       (arg->string a2))]
       [(Xor a1 a2)
-       (string-append tab "xor "
+       (string-append tab "eor "
+                      (arg->string a1) ", "
                       (arg->string a1) ", "
                       (arg->string a2))]
 
       ;;; Move - the first difficult instruction ;;;
 
       [(Mov a1 a2)
-       (string-append tab "mov "
-                      (arg->string a1) ", "
-                      (arg->string a2))]
+       (match (cons a1 a2)
+        ;; Arm doesn't support the `reg <- offset` style move, so we replace with a load
+        ; Special case - stack operation
+        [(cons (? reg?) (Offset 'rsp (? integer? off))) (string-append tab "ldp xzr, "
+                                                                       (arg->string a1) ", [sp, "
+                                                                       ; Everything stack-related gets
+                                                                       ; multiplied by 2
+                                                                       (immediate->string (* off 2))
+                                                                       "]")]
+
+        [(cons (? reg?) (Offset _ _)) (string-append tab "ldr "
+                                                         (arg->string a1) ", "
+                                                         (arg->string a2))]
+
+        ;; Arm doesn't support the `offset <- reg` style move, so we replace with a store
+        ; Special case - stack operation
+        [(cons (Offset 'rsp (? integer? off)) (? reg?)) (string-append tab "stp xzr, "
+                                                                       (arg->string a2) ", [sp, "
+                                                                       ; Everything stack-related gets
+                                                                       ; multiplied by 2
+                                                                       (immediate->string (* off 2))
+                                                                       "]")]
+
+        [(cons (Offset _ _) (? reg?)) (string-append tab "str "
+                                                         (arg->string a2) ", "
+                                                         (arg->string a1))]
+
+        ;; Default case - just translate to an Arm mov
+        [_ (string-append tab "mov "
+           (arg->string a1) ", "
+           (arg->string a2))])]
 
       ;;; Comparisons and conditional jumps ;;;
       ;;; Unexpectedly, these are actually probably the most trivial translations found in this
@@ -295,14 +343,17 @@
                                                 (Mov dst src)
                                                 (Label nomov)))))]
       [(Call l)
-       (string-append tab "call "
-                      (jump-target->string l))]
+       (string-append tab "stp x29, x30, [sp, #-16]!\n" ; Store return address to stack
+                      tab "mov x29, sp\n"
+                      tab "bl " (jump-target->string l) "\n"
+                      tab "ldp x29, x30, [sp], #16")]
       [(Push a)
-       (string-append tab "push "
-                      (arg->string a))]
+       (string-append tab "mov x13, " (arg->string a) "\n"
+                      tab "stp xzr, x13, [sp, #-16]!\n")]
       [(Pop r)
-       (string-append tab "pop "
-                      (reg->string r))]
+       (string-append tab "ldp xzr, "
+                      (reg->string r)
+                      ", [sp], #16")]
       [(Lea d (? offset? x))
        (string-append tab "lea "
                       (arg->string d) ", "
