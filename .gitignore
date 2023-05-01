@@ -1,5 +1,6 @@
 ### Repo-specific stuff ###
 courselangs/
+submit.zip
 
 ### Standard macOS gitignore stuff ###
 .DS_Store
